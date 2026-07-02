@@ -1,36 +1,66 @@
-const express = require('express');
-const { exec } = require('child_process');
-const path = require('path');
-const app = express();
-const PORT = process.env.PORT || 3000;
+ const http = require('http');
+    const https = require('https');
 
-// Разрешаем запуск бинарника внутри контейнера Render
-exec('chmod +x ./opera-proxy.linux-amd64', (err) => {
-    if (err) console.error('Не удалось выдать права бинарнику:', err);
-    else console.log('Права на запуск бинарника успешно выданы.');
-});
+    const PORT = process.env.PORT || 3000;
+    const API_HOST = 'api2.sec-tunnel.com';
 
-app.get('/get-config', (req, res) => {
-    console.log('Получен запрос на генерацию конфига. Обращаюсь к API Opera...');
-    
-    // Запускаем линуксовый бинарник для вывода списка прокси
-    exec('./opera-proxy.linux-amd64 -country EU -list-proxies', (error, stdout, stderr) => {
-        if (error) {
-            console.error(`Ошибка при работе утилиты: ${error.message}`);
-            res.status(500).send(`Ошибка генерации на стороне сервера: ${error.message}`);
-            return;
+    // Заголовки, которые не нужно пробрасывать в обе стороны
+    const HOP_BY_HOP = new Set([
+      'connection', 'keep-alive', 'proxy-authenticate',
+      'proxy-authorization', 'te', 'trailer',
+      'transfer-encoding', 'upgrade', 'host',
+    ]);
+
+    function filterHeaders(raw) {
+      const out = {};
+      for (const [key, value] of Object.entries(raw)) {
+        if (!HOP_BY_HOP.has(key.toLowerCase())) {
+          out[key] = value;
         }
-        
-        // Устанавливаем заголовки, чтобы твой Мак понял, что это CSV-файл
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', 'attachment; filename="proxies.csv"');
-        
-        // Отправляем сгенерированные данные обратно на Мак
-        res.send(stdout);
-        console.log('Конфиг успешно сгенерирован и отправлен клиенту.');
-    });
-});
+      }
+      return out;
+    }
 
-app.listen(PORT, () => {
-    console.log(`Сервер воркера запущен на порту ${PORT}`);
-});
+    const server = http.createServer((req, res) => {
+      // Пропускаем только /v4/* — всё остальное отдаём 404
+      if (!req.url.startsWith('/v4/')) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found. This relay only proxies /v4/* to api2.sec-tunnel.com.');
+        return;
+      }
+
+      const fwdHeaders = filterHeaders(req.headers);
+      fwdHeaders['host'] = API_HOST; // Устанавливаем правильный хост для Opera API
+
+      const options = {
+        hostname: API_HOST,
+        port: 443,
+        path: req.url,
+        method: req.method,
+        headers: fwdHeaders,
+      };
+
+      console.log(`[relay] ${req.method} ${req.url} -> https://${API_HOST}${req.url}`);
+
+      const proxyReq = https.request(options, (proxyRes) => {
+        const respHeaders = filterHeaders(proxyRes.headers);
+        res.writeHead(proxyRes.statusCode, respHeaders);
+        proxyRes.pipe(res);
+      });
+
+      proxyReq.on('error', (err) => {
+        console.error(`[relay] upstream error: ${err.message}`);
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+        }
+        res.end(`Upstream error: ${err.message}`);
+      });
+
+      // Если был запрос с телом (POST), передаем его
+      req.pipe(proxyReq);
+    });
+
+    server.listen(PORT, () => {
+      console.log(`[relay] Opera API relay listening on http://0.0.0.0:${PORT}`);
+      console.log(`[relay] Proxying /v4/* -> https://${API_HOST}/v4/*`);
+    });
